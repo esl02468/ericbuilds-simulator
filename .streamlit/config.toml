@@ -1,0 +1,14 @@
+# Dark theme matching the look of the reference page (near-black bg, blue accent).
+[theme]
+base = "dark"
+primaryColor = "#4a9eff"
+backgroundColor = "#0a0a0c"
+secondaryBackgroundColor = "#16181d"
+textColor = "#e6e6e6"
+font = "sans serif"
+
+[server]
+# allow embedding in an <iframe> on ericbuilds.xyz
+enableCORS = false
+enableXsrfProtection = false
+headless = true
