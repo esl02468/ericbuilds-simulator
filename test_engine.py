@@ -288,3 +288,51 @@ def test_load_rejects_missing_pnl():
         assert "profit" in str(e).lower()
     else:
         raise AssertionError("expected ValueError")
+
+
+# ── edge finder ─────────────────────────────────────────────────────────────
+def _sample_series():
+    by_day, _, _ = data_loader.sample_trades()
+    return engine.daily_series(by_day)
+
+
+def test_breakeven_multiplier_brackets_edge():
+    s = _sample_series()
+    m = engine.breakeven_multiplier(s, Params(), months=12)
+    assert 0 < m < 1.0
+    below = engine.simulate_period(s, 12, engine._with(Params(), size_multiplier=m * 0.9))
+    above = engine.simulate_period(s, 12, engine._with(Params(), size_multiplier=m * 1.1))
+    assert below["median_net"] <= 0 < above["median_net"]
+
+
+def test_breakeven_multiplier_edge_cases():
+    assert engine.breakeven_multiplier([-100.0] * 30, Params(), months=12) == float("inf")
+    p = Params(challenge_fee=0, use_vps=False, audition_target=10, audition_dd=5000,
+               audition_consistency_pct=0, payout_trigger=20, payout_amount=10,
+               min_payout_days=0, payout_delay_days=0, start_frequency="monthly")
+    assert engine.breakeven_multiplier([100.0] * 30, p, months=12) == 0.0
+
+
+def test_edge_sweep_rows_and_flags():
+    s = _sample_series()
+    rows = engine.edge_sweep(s, Params(), {"ref": {}, "no_vps": {"use_vps": False}},
+                             multipliers=(0.5, 1.0), months=12)
+    assert len(rows) == 4
+    by = {(r["variant"], r["multiplier"]): r for r in rows}
+    assert by[("ref", 0.5)]["has_edge"] is False
+    assert by[("ref", 1.0)]["has_edge"] is True
+    assert by[("no_vps", 0.5)]["avg_roi"] > by[("ref", 0.5)]["avg_roi"]
+    assert set(by[("ref", 1.0)]["outcome_mix"]) <= {engine.OUTCOME_FUNDED_ACTIVE,
+                                                    engine.OUTCOME_AUDITION_RUNNING,
+                                                    engine.OUTCOME_AUDITION_BLOWN,
+                                                    engine.OUTCOME_FUNDED_BLOWN}
+
+
+def test_accounts_curve_scales_prop_side_only():
+    s = _sample_series()
+    curve = engine.accounts_curve(s, Params(), counts=(1, 2), months=12)
+    one, two = curve
+    assert two["pct_positive_roi"] >= one["pct_positive_roi"]
+    # net(2) - net(1) equals the per-account net before VPS (VPS does not scale)
+    p1 = engine.simulate_period(s, 12, Params(num_accounts=1))
+    assert abs((two["avg_net"] - one["avg_net"]) - (p1["avg_payout_cash"] - p1["avg_prop_fees"])) < 1.0

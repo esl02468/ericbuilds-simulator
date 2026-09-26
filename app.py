@@ -315,6 +315,102 @@ def _run_cached(series: tuple, params: dict) -> dict:
     return engine.run(list(series), Params(**params))
 
 
+EDGE_MULTIPLIERS = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+
+
+@st.cache_data(show_spinner=False)
+def _edge_cached(series: tuple, params: dict) -> dict:
+    """Edge Finder: sweep the current rules + every preset across trade sizes."""
+    base = Params(**params)
+    variants = {"Your current rules": {}}
+    variants.update({k: v for k, v in PRESETS.items() if v})
+    s = list(series)
+    return {
+        "sweep": engine.edge_sweep(s, base, variants, EDGE_MULTIPLIERS, months=24),
+        "breakeven": {k: engine.breakeven_multiplier(s, engine._with(base, **v))
+                      for k, v in variants.items()},
+        "accounts": engine.accounts_curve(s, base, counts=(1, 2, 3, 5, 10), months=24),
+    }
+
+
+def edge_finder_tab(series: list, p: Params, stats: dict):
+    st.subheader("Edge Finder — which rules and sizing actually pay?")
+    st.caption("A configuration **has edge** when the median trader ends net positive *and* more "
+               "than half of all traders end with positive ROI — so it is not carried by a few "
+               "lucky early starters. 24-month horizon, same start frequency and VPS as the sidebar.")
+    key = (tuple(series), p.to_dict())
+    if st.button("Run Edge Finder", type="primary",
+                 help="Runs ~90 simulations (a few seconds). Results are cached per setting."):
+        st.session_state["edge_key"] = key
+    if st.session_state.get("edge_key") is None:
+        st.info("Click **Run Edge Finder** to sweep your current rules and every firm preset "
+                "across trade sizes and account counts.")
+        return
+    if st.session_state["edge_key"] != key:
+        st.warning("Sidebar settings changed since the last run — click **Run Edge Finder** to refresh.")
+    series_t, params_d = st.session_state["edge_key"]
+    with st.spinner("Sweeping rule sets and trade sizes…"):
+        res = _edge_cached(series_t, params_d)
+    sweep = pd.DataFrame(res["sweep"])
+    avg_day = stats["avg_day"] if stats["days"] else 0.0
+
+    # ── verdict for the current rules at the current size ──
+    cur = sweep[(sweep["variant"] == "Your current rules") & (sweep["multiplier"] == 1.0)].iloc[0]
+    be = res["breakeven"]["Your current rules"]
+    c = st.columns(4)
+    c[0].metric("Your rules at current size", "HAS EDGE ✅" if cur["has_edge"] else "NO EDGE ❌")
+    c[1].metric("Median trader net (24 mo)", f"${cur['median_net']:,.0f}")
+    c[2].metric("Traders with positive ROI", f"{cur['pct_positive_roi']}%")
+    if be == float("inf"):
+        c[3].metric("Break-even size", "none ≤ 5×", help="Even at 5× size the median trader loses.")
+    else:
+        c[3].metric("Break-even size", f"{be:.2f}×",
+                    help=f"≈ ${avg_day * be:,.0f}/day average needed under these rules "
+                         f"(your data averages ${avg_day:,.0f}/day at 1×).")
+
+    # ── edge map ──
+    st.markdown("### Edge map — median trader net by rule set and trade size")
+    pivot = sweep.pivot(index="multiplier", columns="variant", values="median_net")
+    pivot.index = [f"{m}×" for m in pivot.index]
+    st.line_chart(pivot)
+    be_rows = [{"Rule set": k, "Break-even size": ("none ≤ 5×" if v == float("inf") else f"{v:.2f}×"),
+                "Avg $/day needed": ("—" if v == float("inf") else f"${avg_day * v:,.0f}"),
+                "Has edge at 1×": "✅" if bool(sweep[(sweep.variant == k) & (sweep.multiplier == 1.0)]
+                                            ["has_edge"].iloc[0]) else "❌"}
+               for k, v in res["breakeven"].items()]
+    st.dataframe(pd.DataFrame(be_rows), width="stretch", hide_index=True)
+
+    # ── what is binding ──
+    st.markdown("### Payout cadence — average payouts per trader by trade size")
+    st.caption("Where a line flattens, size no longer helps: payout amount, qualifying-day rules "
+               "or the approval wait have become the binding constraint, not profit.")
+    cad = sweep.pivot(index="multiplier", columns="variant", values="avg_payouts")
+    cad.index = [f"{m}×" for m in cad.index]
+    st.line_chart(cad)
+
+    # ── accounts leverage ──
+    st.markdown("### Copy-trading leverage — your rules, more parallel accounts")
+    st.caption("Payouts and prop fees scale with accounts; the VPS does not. If one account is net "
+               "positive before VPS, every extra account adds that much again.")
+    acc = pd.DataFrame(res["accounts"])
+    st.line_chart(acc.set_index("accounts")[["median_net", "avg_net"]])
+
+    # ── full table ──
+    st.markdown("### All configurations")
+    show = sweep[["variant", "multiplier", "avg_day", "has_edge", "pass_rate", "avg_payouts",
+                  "median_net", "avg_net", "avg_roi", "pct_positive_roi", "pct_funded_paid",
+                  "pct_funded_blown", "operation_net"]].rename(columns={
+        "variant": "Rule set", "multiplier": "Size", "avg_day": "Avg $/day", "has_edge": "Edge",
+        "pass_rate": "Pass %", "avg_payouts": "Payouts/trader", "median_net": "Median net ($)",
+        "avg_net": "Avg net ($)", "avg_roi": "Avg ROI %", "pct_positive_roi": "Positive ROI %",
+        "pct_funded_paid": "Funded that got paid %", "pct_funded_blown": "Funded blown %",
+        "operation_net": "Operation net ($)"})
+    show["Edge"] = show["Edge"].map({True: "✅", False: "❌"})
+    st.dataframe(show, width="stretch", hide_index=True)
+    st.download_button("Download Edge Finder results as CSV",
+                       show.to_csv(index=False).encode("utf-8"), "edge_finder.csv", "text/csv")
+
+
 def main():
     p, upload, use_sample, subtract_commission = sidebar()
 
@@ -342,7 +438,8 @@ def main():
     stats = engine.strategy_stats(series)
     results = _run_cached(tuple(series), p.to_dict())
 
-    tabs = st.tabs(["Data Preview", "Simulation Results", "Trader Details", "Monthly Profit Projection"])
+    tabs = st.tabs(["Data Preview", "Simulation Results", "Trader Details",
+                    "Monthly Profit Projection", "Edge Finder"])
 
     with tabs[0]:
         st.subheader("Trade Data Preview")
@@ -441,6 +538,9 @@ def main():
                                     "cumulative_net": "Cumulative Net ($)",
                                     "first_trader_cumulative_net": "First Trader Cumulative ($)"})
         st.dataframe(show, width="stretch", hide_index=True)
+
+    with tabs[4]:
+        edge_finder_tab(series, p, stats)
 
 
 if __name__ == "__main__":

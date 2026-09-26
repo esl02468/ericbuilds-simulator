@@ -450,3 +450,97 @@ def strategy_stats(series: Sequence[float]) -> Dict:
         "worst_day": round(min(series), 2),
         "max_drawdown": round(max_dd, 2),
     }
+
+
+# ── edge finder ──────────────────────────────────────────────────────────────
+def _with(p: Params, **overrides) -> Params:
+    d = p.to_dict()
+    d.update(overrides)
+    return Params(**d)
+
+
+def diagnose(period: Dict) -> Dict:
+    """Why traders do / don't make money in a period result: outcome mix and
+    what is binding (audition, blow-ups, or payout cadence)."""
+    rows = period["traders"]
+    n = len(rows) or 1
+    mix = {}
+    for r in rows:
+        mix[r["outcome"]] = mix.get(r["outcome"], 0) + 1
+    funded = [r for r in rows if r["passed"]]
+    paid = [r for r in funded if r["payouts"] > 0]
+    return {
+        "outcome_mix": {k: round(100.0 * v / n, 1) for k, v in sorted(mix.items())},
+        "pct_funded": round(100.0 * len(funded) / n, 1),
+        "pct_funded_paid": round(100.0 * len(paid) / max(1, len(funded)), 1),
+        "pct_funded_blown": round(100.0 * sum(1 for r in funded
+                                              if r["outcome"] == OUTCOME_FUNDED_BLOWN)
+                                  / max(1, len(funded)), 1),
+    }
+
+
+def breakeven_multiplier(series: Sequence[float], p: Params, months: int = 24,
+                         lo: float = 0.05, hi: float = 5.0, metric: str = "median_net") -> float:
+    """Smallest size multiplier at which the period `metric` turns positive
+    (bisection). Returns inf if even `hi` has no edge, 0 if `lo` already has."""
+    def f(m):
+        return simulate_period(series, months, _with(p, size_multiplier=m))[metric]
+    if f(hi) <= 0:
+        return math.inf
+    if f(lo) > 0:
+        return 0.0
+    for _ in range(14):
+        mid = (lo + hi) / 2
+        if f(mid) > 0:
+            hi = mid
+        else:
+            lo = mid
+    return round(hi, 3)
+
+
+def edge_sweep(series: Sequence[float], base: Params, variants: Dict[str, Dict],
+               multipliers: Sequence[float] = (0.5, 1.0, 1.5, 2.0, 3.0),
+               months: int = 24) -> List[Dict]:
+    """Run every rule variant x size multiplier and report whether it has edge.
+
+    A configuration "has edge" when the median trader ends net positive AND
+    more than half of the traders end with positive ROI — i.e. it is not
+    carried by the lucky early starters."""
+    rows = []
+    for name, overrides in variants.items():
+        p = _with(base, **overrides)
+        for mult in multipliers:
+            r = simulate_period(series, months, _with(p, size_multiplier=mult))
+            first = r["traders"][0] if r["traders"] else {"net": 0.0, "payouts": 0}
+            per_acc = (r["avg_payout_cash"] - r["avg_prop_fees"]) / max(1, p.num_accounts)
+            rows.append({
+                "variant": name,
+                "multiplier": mult,
+                "avg_day": round(sum(series) / max(1, len(series)) * mult, 2),
+                "pass_rate": r["pass_rate"],
+                "avg_payouts": r["avg_payouts"],
+                "avg_roi": r["avg_roi"],
+                "median_net": r["median_net"],
+                "avg_net": r["avg_net"],
+                "pct_positive_roi": r["pct_positive_roi"],
+                "first_trader_net": first["net"],
+                "first_trader_payouts": first["payouts"],
+                "operation_net": r["total_net"],
+                "net_per_account_before_vps": round(per_acc, 2),
+                "has_edge": bool(r["median_net"] > 0 and r["pct_positive_roi"] > 50),
+                **diagnose(r),
+            })
+    return rows
+
+
+def accounts_curve(series: Sequence[float], p: Params, counts: Sequence[int] = (1, 2, 3, 5, 10),
+                   months: int = 24) -> List[Dict]:
+    """Average ROI / net per trader as the number of parallel accounts grows.
+    Prop fees and payouts scale with accounts; the VPS does not."""
+    out = []
+    for n in counts:
+        r = simulate_period(series, months, _with(p, num_accounts=int(n)))
+        out.append({"accounts": int(n), "avg_net": r["avg_net"], "median_net": r["median_net"],
+                    "avg_roi": r["avg_roi"], "pct_positive_roi": r["pct_positive_roi"],
+                    "operation_net": r["total_net"]})
+    return out
